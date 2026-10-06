@@ -1,35 +1,44 @@
+# Newsletter Signup Assistant — GitHub Codespaces
 
-# Newsletter Subscription Tool — Browser Version
-
-Runs as a small Flask web app in GitHub Codespaces.
+A small Flask browser app for checking newsletter signup URLs from a CSV.
 
 ## CSV format
 
-Your CSV must have these headers:
+Create a CSV such as:
 
 ```csv
 brand,signup_url
 Example Brand,https://example.com/newsletter
+Another Brand,https://example.org/subscribe
 ```
 
-## Codespaces setup
+## Run in GitHub Codespaces
 
-In the Codespaces terminal:
+1. Create a new GitHub repository.
+2. Upload this project.
+3. Open the repository in **Codespaces**.
+4. In the Codespaces terminal run:
 
 ```bash
 pip install -r requirements.txt
-python -m playwright install --with-deps chromium
 python app.py
 ```
 
-Then open port **8000** in the Codespaces Ports panel.
+5. When Codespaces detects port `5000`, open the forwarded port in the browser.
 
-## Important behavior
+## What it does
 
-- Uses only the email address you enter.
-- Uses only signup URLs supplied in your CSV.
-- Runs Chromium visibly only in the original desktop app; this browser version uses headless Chromium because Codespaces has no desktop display.
-- Does not bypass CAPTCHA, Cloudflare, anti-bot checks, access controls, or email verification.
-- A detected challenge is recorded as `manual_review`.
-- `submitted` means the form was submitted; it does not guarantee that the site accepted the subscription or that a confirmation email was received.
-- Use only with brands/sites where you are permitted to subscribe and with an email address you control.
+- Validates the CSV.
+- Removes duplicate signup URLs.
+- Checks each URL sequentially.
+- Reports HTTP failures and non-HTML pages.
+- Marks reachable signup pages as **Manual signup required**.
+- Exports the results as CSV.
+
+## Safety / anti-bot behavior
+
+This version intentionally does not automate arbitrary form submissions or attempt to bypass CAPTCHA, Cloudflare, consent requirements, rate limits, or other anti-bot controls. Newsletter providers can have different forms and terms, so the app leaves the actual signup action to the user.
+
+## Important
+
+Do not commit passwords, API keys, SMTP credentials, or private email credentials to GitHub. The email entered in this app is only used as the value shown to the local job; this version does not send or store mail credentials.

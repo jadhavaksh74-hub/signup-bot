@@ -1,201 +1,169 @@
-
-import asyncio
-import csv
-import io
-import re
-import threading
-from pathlib import Path
-from flask import Flask, jsonify, render_template, request, send_file
-from playwright.async_api import async_playwright
+from flask import Flask, render_template, request, jsonify, send_file
+import csv, io, os, time, uuid
+from urllib.parse import urlparse
+import requests
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
-jobs = {}
-job_counter = 0
-lock = threading.Lock()
+JOBS = {}
 
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; NewsletterSignupAssistant/1.0)"
+}
 
-def challenge_text(text):
-    t = (text or "").lower()
-    words = [
-        "captcha", "recaptcha", "hcaptcha", "cloudflare",
-        "verify you are human", "checking your browser",
-        "security challenge", "access denied"
-    ]
-    return any(w in t for w in words)
-
-async def find_email_input(page):
-    selectors = [
-        'input[type="email"]',
-        'input[name*="email" i]',
-        'input[id*="email" i]',
-        'input[placeholder*="email" i]',
-    ]
-    for selector in selectors:
-        try:
-            el = page.locator(selector).first
-            if await el.count() and await el.is_visible():
-                return el
-        except Exception:
-            pass
-    return None
-
-async def subscribe_one(page, brand, url, email):
+def valid_url(url):
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(1200)
+        p = urlparse(url.strip())
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
 
-        body = await page.locator("body").inner_text(timeout=5000)
-        if challenge_text(body):
-            return "manual_review", "CAPTCHA/anti-bot challenge detected"
+def load_csv(file_storage):
+    raw = file_storage.read()
+    text = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("CSV must contain headers: brand,signup_url")
 
-        field = await find_email_input(page)
-        if not field:
-            return "failed", "No visible email field found"
+    fields = {f.strip().lower(): f for f in reader.fieldnames}
+    if "brand" not in fields or "signup_url" not in fields:
+        raise ValueError("CSV must contain columns named brand and signup_url")
 
-        await field.fill(email)
+    rows = []
+    seen = set()
+    for row in reader:
+        brand = (row.get(fields["brand"]) or "").strip()
+        url = (row.get(fields["signup_url"]) or "").strip()
+        if not brand and not url:
+            continue
+        if not valid_url(url):
+            rows.append({"brand": brand or "(unnamed)", "signup_url": url, "status": "Invalid URL"})
+            continue
+        key = url.lower().rstrip("/")
+        if key in seen:
+            rows.append({"brand": brand or "(unnamed)", "signup_url": url, "status": "Duplicate skipped"})
+            continue
+        seen.add(key)
+        rows.append({"brand": brand or "(unnamed)", "signup_url": url, "status": "Queued"})
+    return rows
 
-        # Prefer a nearby newsletter/subscribe button, then common submit controls.
-        candidates = [
-            'button:has-text("Subscribe")',
-            'button:has-text("Sign up")',
-            'button:has-text("Join")',
-            'input[type="submit"]',
-            'button[type="submit"]',
-        ]
-        clicked = False
-        for selector in candidates:
-            try:
-                btn = page.locator(selector).first
-                if await btn.count() and await btn.is_visible() and await btn.is_enabled():
-                    await btn.click()
-                    clicked = True
-                    break
-            except Exception:
-                pass
+def process_job(job_id, email):
+    job = JOBS[job_id]
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
 
-        if not clicked:
-            await field.press("Enter")
+    for item in job["rows"]:
+        if job["stop"]:
+            item["status"] = "Stopped"
+            continue
 
-        await page.wait_for_timeout(1800)
-        after = await page.locator("body").inner_text(timeout=5000)
-        if challenge_text(after):
-            return "manual_review", "Challenge appeared after submission"
+        if item["status"] != "Queued":
+            continue
 
-        return "submitted", "Form submitted; check inbox if confirmation is required"
-    except Exception as e:
-        return "failed", str(e)[:300]
+        url = item["signup_url"]
+        item["status"] = "Checking page..."
+        job["current"] = item["brand"]
+        try:
+            r = session.get(url, timeout=15, allow_redirects=True)
+            ct = r.headers.get("content-type", "")
+            if r.status_code >= 400:
+                item["status"] = f"Page unavailable (HTTP {r.status_code})"
+            elif "text/html" not in ct.lower():
+                item["status"] = "Not an HTML signup page"
+            else:
+                # We deliberately do not attempt to submit arbitrary forms.
+                # This avoids guessing form fields and bypassing anti-bot controls.
+                item["status"] = "Manual signup required"
+                item["final_url"] = r.url
+        except requests.RequestException as exc:
+            item["status"] = "Connection failed"
+            item["error"] = str(exc)[:160]
 
-async def run_job(job_id, rows, email):
-    results = []
-    jobs[job_id]["status"] = "running"
+        time.sleep(0.25)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        for i, row in enumerate(rows):
-            if jobs[job_id].get("stop"):
-                jobs[job_id]["status"] = "stopped"
-                break
-
-            brand = row["brand"].strip()
-            url = row["signup_url"].strip()
-            status, message = await subscribe_one(page, brand, url, email)
-            results.append({
-                "brand": brand,
-                "signup_url": url,
-                "status": status,
-                "message": message,
-            })
-            jobs[job_id]["current"] = i + 1
-            jobs[job_id]["results"] = results
-            await asyncio.sleep(1.5)
-
-        await browser.close()
-
-    if jobs[job_id]["status"] == "running":
-        jobs[job_id]["status"] = "completed"
+    job["done"] = True
+    job["current"] = ""
 
 @app.route("/")
 def index():
     return render_template("index.html")
 
-@app.post("/start")
+@app.post("/api/start")
 def start():
-    global job_counter
-    email = request.form.get("email", "").strip()
-    file = request.files.get("csv")
-    if not EMAIL_RE.match(email):
+    email = (request.form.get("email") or "").strip()
+    upload = request.files.get("csv")
+
+    if not email:
+        return jsonify(error="Enter an email address."), 400
+    if "@" not in email or "." not in email.split("@")[-1]:
         return jsonify(error="Enter a valid email address."), 400
-    if not file:
+    if not upload or not upload.filename.lower().endswith(".csv"):
         return jsonify(error="Upload a CSV file."), 400
 
     try:
-        text = file.read().decode("utf-8-sig")
-        reader = csv.DictReader(io.StringIO(text))
-        if not reader.fieldnames or "brand" not in reader.fieldnames or "signup_url" not in reader.fieldnames:
-            return jsonify(error="CSV must contain exactly these required headers: brand, signup_url"), 400
-
-        rows = []
-        seen = set()
-        for r in reader:
-            brand = (r.get("brand") or "").strip()
-            url = (r.get("signup_url") or "").strip()
-            if not brand or not url or url in seen:
-                continue
-            if not re.match(r"^https?://", url, re.I):
-                continue
-            seen.add(url)
-            rows.append({"brand": brand, "signup_url": url})
-
-        if not rows:
-            return jsonify(error="No valid rows found."), 400
-
-        with lock:
-            job_counter += 1
-            job_id = str(job_counter)
-            jobs[job_id] = {
-                "status": "queued", "total": len(rows), "current": 0,
-                "results": [], "stop": False
-            }
-
-        threading.Thread(
-            target=lambda: asyncio.run(run_job(job_id, rows, email)),
-            daemon=True
-        ).start()
-        return jsonify(job_id=job_id)
-    except Exception as e:
+        rows = load_csv(upload)
+    except ValueError as e:
         return jsonify(error=str(e)), 400
 
-@app.get("/status/<job_id>")
-def status(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify(error="Job not found"), 404
-    return jsonify(job)
+    if not rows:
+        return jsonify(error="The CSV contains no usable rows."), 400
 
-@app.post("/stop/<job_id>")
-def stop(job_id):
-    job = jobs.get(job_id)
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {
+        "email": email,
+        "rows": rows,
+        "stop": False,
+        "done": False,
+        "current": ""
+    }
+
+    import threading
+    threading.Thread(target=process_job, args=(job_id, email), daemon=True).start()
+    return jsonify(job_id=job_id, count=len(rows))
+
+@app.get("/api/status/<job_id>")
+def status(job_id):
+    job = JOBS.get(job_id)
     if not job:
-        return jsonify(error="Job not found"), 404
+        return jsonify(error="Job not found."), 404
+    return jsonify(
+        done=job["done"],
+        current=job["current"],
+        rows=job["rows"]
+    )
+
+@app.post("/api/stop/<job_id>")
+def stop(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify(error="Job not found."), 404
     job["stop"] = True
     return jsonify(ok=True)
 
-@app.get("/download/<job_id>")
-def download(job_id):
-    job = jobs.get(job_id)
+@app.get("/api/export/<job_id>")
+def export(job_id):
+    job = JOBS.get(job_id)
     if not job:
-        return "Job not found", 404
+        return jsonify(error="Job not found."), 404
+
     output = io.StringIO()
-    fields = ["brand", "signup_url", "status", "message"]
-    writer = csv.DictWriter(output, fieldnames=fields)
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["brand", "signup_url", "status", "final_url", "error"],
+        extrasaction="ignore"
+    )
     writer.writeheader()
-    writer.writerows(job.get("results", []))
+    writer.writerows(job["rows"])
+
     data = io.BytesIO(output.getvalue().encode("utf-8"))
-    return send_file(data, mimetype="text/csv", as_attachment=True,
-                     download_name="subscription_results.csv")
+    return send_file(
+        data,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="subscription_results.csv"
+    )
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
